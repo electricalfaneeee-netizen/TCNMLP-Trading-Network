@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import gymnasium as gym
+import pandas as pd
+import numpy as np
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
@@ -31,33 +34,94 @@ class TCNMLP(nn.Module):
         self.encoder = encoder
 
         self.MLP_stack = nn.Sequential(
-                nn.Linear(30, 64),
-                nn.SiLU(),
-                nn.Linear(64, 64),
-                nn.SiLU(),
-                nn.Linear(64, 30),
-                nn.SiLU(),
+            nn.Linear(31, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
+            nn.SiLU(),
+            nn.Linear(64, 30),
+            nn.SiLU()
          )
 
         self.actor = nn.Sequential(
-                nn.Linear(60, 64),
-                nn.SiLU(),
-                nn.Dropout(0.2),
-                nn.Linear(64, 2),
-                nn.LogSoftmax(dim=-1),
+            nn.Linear(61, 64),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 2),
+            nn.LogSoftmax(dim=-1)
         )
 
         self.critic = nn.Sequential(
-                nn.Linear(60, 64),
-                nn.SiLU(),
-                nn.Dropout(0.05),
-                nn.Linear(64, 1),
+            nn.Linear(61, 64),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+            nn.Linear(64, 1)
         )
-    def forward(self, x):
+
+    def forward(self, x, state):
+        x = x.transpose(1, 2)
+
         encoded = self.encoder(x)
+        last_encoding = encoded[:, -1, :]
+
+        encoded = torch.cat((last_encoding, state.unsqueeze(-1)), dim=-1)
+
         encoded = torch.cat((self.MLP_stack(encoded), encoded), dim=-1)
 
         policy = self.actor(encoded)
         value = self.critic(encoded)
 
         return policy, value
+
+class TradingEnv(gym.Env):
+    def __init__(self, df: pd.DataFrame, window_size: int = 100):
+        super().__init__()
+        self.data = df.to_numpy().astype(np.float32)
+        self.window_size = window_size
+        self.action_space = spaces.Discrete(2)
+
+        self.observation_space = spaces.Dict({
+            "chart": spaces.Box(-np.inf, np.inf, shape=(window_size, 5), dtype=np.float32),
+            "state": spaces.Discrete(2)
+        })
+        
+        self.current_step = 0
+        self.active_state = 0
+        self.entry_price_idx = 0
+        self.idx_pos = 0
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.active_state = 0
+        self.entry_price_idx = 0
+        self.idx_pos = self.window_size
+
+        observations = {
+            "chart": self.data[self.idx_pos - self.window_size:self.idx_pos],
+            "state": self.active_state
+        }
+
+        return observations, {}
+
+    def step(self, action: int) -> Tuple:
+        traded = action != self.active_state
+        
+        self.entry_price_idx = self.idx_pos
+            
+        self.idx_pos += 1
+        current_return = self.data[self.idx_pos, 0]
+
+        transaction_cost = 0.001 if traded else 0.0
+        
+        reward = (current_return * action) - transaction_cost
+
+        self.active_state = action
+        
+        done = self.idx_pos >= len(self.data) - 1
+        
+        observation = {
+            "chart": self.data[self.idx_pos - self.window_size:self.idx_pos],
+            "state": self.active_state
+        }
+        return observation, reward, done, False, {}
+
