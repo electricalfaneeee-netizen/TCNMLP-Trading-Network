@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import gymnasium as gym
+from gymnasium import spaces
 import pandas as pd
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
@@ -28,7 +30,7 @@ encoder = torch.compile(TCNEncoder().to(device))
 encoder.load_state_dict(torch.load(f"{script_dir}/models/encoder.pt", map_location=device))
     
 class TCNMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, encoder):
         super().__init__()
 
         self.encoder = encoder
@@ -63,7 +65,8 @@ class TCNMLP(nn.Module):
         encoded = self.encoder(x)
         last_encoding = encoded[:, -1, :]
 
-        encoded = torch.cat((last_encoding, state.unsqueeze(-1)), dim=-1)
+        state_float = state.float()
+        encoded = torch.cat((last_encoding, state_float.unsqueeze(-1)), dim=-1)
 
         encoded = torch.cat((self.MLP_stack(encoded), encoded), dim=-1)
 
@@ -77,10 +80,13 @@ class TradingEnv(gym.Env):
         super().__init__()
         self.data = df.to_numpy().astype(np.float32)
         self.window_size = window_size
+        _windows = sliding_window_view(self.data, window_shape=self.window_size, axis=0)
+        self.windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+
         self.action_space = spaces.Discrete(2)
 
         self.observation_space = spaces.Dict({
-            "chart": spaces.Box(-np.inf, np.inf, shape=(window_size, 5), dtype=np.float32),
+            "chart": spaces.Box(-np.inf, np.inf, shape=(self.window_size, 5), dtype=np.float32),
             "state": spaces.Discrete(2)
         })
         
@@ -97,7 +103,7 @@ class TradingEnv(gym.Env):
         self.idx_pos = self.window_size
 
         observations = {
-            "chart": self.data[self.idx_pos - self.window_size:self.idx_pos],
+            "chart": self.windows[self.idx_pos - self.window_size],
             "state": self.active_state
         }
 
@@ -106,21 +112,26 @@ class TradingEnv(gym.Env):
     def step(self, action: int) -> Tuple:
         traded = action != self.active_state
         
-        self.entry_price_idx = self.idx_pos
+        if traded:
+            self.entry_price_idx = self.idx_pos
             
         self.idx_pos += 1
         current_return = self.data[self.idx_pos, 0]
 
         transaction_cost = 0.001 if traded else 0.0
-        
-        reward = (current_return * action) - transaction_cost
 
-        self.active_state = action
+        if action == 1:
+            reward = current_return - transaction_cost
+        else:
+            reward = -transaction_cost
+            reward -= 0.00001
         
+        self.active_state = action
+
         done = self.idx_pos >= len(self.data) - 1
         
         observation = {
-            "chart": self.data[self.idx_pos - self.window_size:self.idx_pos],
+            "chart": self.windows[self.idx_pos - self.window_size],
             "state": self.active_state
         }
         return observation, reward, done, False, {}
