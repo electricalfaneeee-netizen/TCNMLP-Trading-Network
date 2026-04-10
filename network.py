@@ -116,7 +116,7 @@ class TradingEnv(gym.Env):
             self.entry_price_idx = self.idx_pos
             
         self.idx_pos += 1
-        current_return = self.data[self.idx_pos, 0]
+        current_return = self.data[self.idx_pos, 0] - self.data[self.entry_price_idx, 0]
 
         transaction_cost = 0.001 if traded else 0.0
 
