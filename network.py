@@ -26,9 +26,6 @@ class TCNEncoder(nn.Module):
 
         return self.activation(self.batchNorm(out)).transpose(1, 2)
 
-encoder = torch.compile(TCNEncoder().to(device))
-encoder.load_state_dict(torch.load(f"{script_dir}/models/encoder.pt", map_location=device))
-    
 class TCNMLP(nn.Module):
     def __init__(self, encoder):
         super().__init__()
@@ -76,12 +73,27 @@ class TCNMLP(nn.Module):
         return policy, value
 
 class TradingEnv(gym.Env):
-    def __init__(self, df: pd.DataFrame, window_size: int = 100):
+    def __init__(self, df: pd.DataFrame, window_size=100, max_steps=2048):
         super().__init__()
-        self.data = df.to_numpy().astype(np.float32)
+        self.raw_data = df.to_numpy().astype(np.float32)
         self.window_size = window_size
-        _windows = sliding_window_view(self.data, window_shape=self.window_size, axis=0)
-        self.windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+        
+        _windows = np.lib.stride_tricks.sliding_window_view(self.raw_data, window_shape=window_size, axis=0)
+        windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+        
+        price_slice = windows[:, :4, :]
+        p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
+        p_std = price_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+        windows[:, :4, :] = (price_slice - p_mean) / p_std
+        
+        vol_slice = windows[:, 4:, :]
+        v_mean = vol_slice.mean(axis=(1, 2), keepdims=True)
+        v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+        windows[:, 4:, :] = (vol_slice - v_mean) / v_std
+        
+        self.windows = windows
+
+        self.log_returns = normalize_reward_data(df)
 
         self.action_space = spaces.Discrete(2)
 
@@ -92,18 +104,25 @@ class TradingEnv(gym.Env):
         
         self.current_step = 0
         self.active_state = 0
-        self.entry_price_idx = 0
         self.idx_pos = 0
+
+        self.max_steps = max_steps
+        self.total_rows = len(self.windows)
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        max_start = self.total_rows - self.max_steps - 1
+        self.start_idx = np.random.randint(self.window_size, max_start)
+
         self.current_step = 0
         self.active_state = 0
-        self.entry_price_idx = 0
-        self.idx_pos = self.window_size
+
+        self.idx_pos = self.start_idx
+        self.steps_taken = 0
 
         observations = {
-            "chart": self.windows[self.idx_pos - self.window_size],
+            "chart": self.windows[self.idx_pos],
             "state": self.active_state
         }
 
@@ -112,11 +131,8 @@ class TradingEnv(gym.Env):
     def step(self, action: int) -> Tuple:
         traded = action != self.active_state
         
-        if traded:
-            self.entry_price_idx = self.idx_pos
-            
         self.idx_pos += 1
-        current_return = self.data[self.idx_pos, 0] - self.data[self.entry_price_idx, 0]
+        current_return = self.log_returns[self.idx_pos, 0]
 
         transaction_cost = 0.001 if traded else 0.0
 
@@ -124,15 +140,30 @@ class TradingEnv(gym.Env):
             reward = current_return - transaction_cost
         else:
             reward = -transaction_cost
-            reward -= 0.00001
         
         self.active_state = action
 
-        done = self.idx_pos >= len(self.data) - 1
+        done = self.steps_taken >= self.max_steps
         
         observation = {
-            "chart": self.windows[self.idx_pos - self.window_size],
+            "chart": self.windows[self.idx_pos],
             "state": self.active_state
         }
         return observation, reward, done, False, {}
 
+def normalize_reward_data(df: pd.DataFrame):
+    df_nn = pd.DataFrame(index=df.index)
+    
+    prev_close = df['Close'].shift(1)
+    
+    df_nn['close'] = np.log(df['Close'] / prev_close)
+    
+    df_nn['high'] = np.log(df['High'] / prev_close)
+    
+    df_nn['low'] = np.log(df['Low'] / prev_close)
+    
+    df_nn['open'] = np.log(df['Open'] / prev_close)
+    df_nn['volume'] = np.log(df['Volume'] + 1) - np.log(df['Volume'].rolling(20).mean() + 1)   
+    
+    df_nn = df_nn.replace([np.inf, -np.inf], np.nan)
+    return df_nn.fillna(0).to_numpy()
