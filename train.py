@@ -19,11 +19,11 @@ EPISODES_PER_ROUND = 15
 LR = 3e-4
 
 PPO_EPOCHS = 6
-CLIP_EPSILON = 0.1
+CLIP_EPSILON = 0.07
 GAMMA = 0.99
-GAE_LAMBDA = 0.95
+GAE_LAMBDA = 0.92
 ENTROPY_COEF = 0.02
-VALUE_COEF = 0.5
+VALUE_COEF = 1
 
 def yankSolanaData(start_date, end_date):
     # Parse dates to milliseconds timestamp
@@ -77,7 +77,7 @@ def yankSolanaData(start_date, end_date):
     df = df.reset_index(drop=True)
     return df
 
-def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
+def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.92):
     n = len(rewards)
     advantages = torch.zeros(n, device=device)
     last_gae_lam = 0
@@ -241,7 +241,7 @@ def main():
 
     print(f"Loaded {len(df)} candles")
 
-    env = TradingEnv(df, window_size=100, max_steps=2048)
+    env = TradingEnv(df, window_size=100, max_steps=3072)
 
     history = []
     history_path = Path(f"{script_dir}/training_log.csv")

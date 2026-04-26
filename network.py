@@ -71,7 +71,7 @@ class TCNMLP(nn.Module):
         return policy, value
 
 class TradingEnv(gym.Env):
-    def __init__(self, df: pd.DataFrame, window_size=100, max_steps=2048):
+    def __init__(self, df: pd.DataFrame, window_size=100, max_steps=3072):
         super().__init__()
         self.raw_data = df.to_numpy().astype(np.float32)
         self.window_size = window_size
