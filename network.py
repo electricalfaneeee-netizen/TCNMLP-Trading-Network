@@ -57,8 +57,6 @@ class TCNMLP(nn.Module):
         )
 
     def forward(self, x, state):
-        x = x.transpose(1, 2)
-
         encoded = self.encoder(x)
         last_encoding = encoded[:, -1, :]
 
@@ -132,9 +130,10 @@ class TradingEnv(gym.Env):
         traded = action != self.active_state
         
         self.idx_pos += 1
+        self.steps_taken += 1
         current_return = self.log_returns[self.idx_pos, 0]
 
-        transaction_cost = 0.001 if traded else 0.0
+        transaction_cost = 0.0005 if traded else 0.0
 
         if action == 1:
             reward = current_return - transaction_cost

@@ -5,6 +5,7 @@ import pandas as pd
 import time
 from pathlib import Path
 from network import TCNMLP, TCNEncoder, TradingEnv, device, script_dir
+from torch.optim.lr_scheduler import LinearLR
 
 # environment variables
 exchange = ccxt.binance()
@@ -21,7 +22,7 @@ PPO_EPOCHS = 6
 CLIP_EPSILON = 0.1
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.02
 VALUE_COEF = 0.5
 
 def yankSolanaData(start_date, end_date):
@@ -94,12 +95,12 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     returns = advantages + values
     return advantages, returns
 
-def ppo_training_loop(env, network, optimizer, episodes):
+def ppo_training_loop(env, network, optimizer, scheduler, episodes):
 
     z_score_data = torch.tensor(env.windows, dtype=torch.float32, device=device)
     round_stats = []
 
-    for episode in episodes:
+    for episode in range(episodes):
         obs, _ = env.reset()
         
         log_probs_list = []
@@ -208,6 +209,8 @@ def ppo_training_loop(env, network, optimizer, episodes):
                 "entropy": entropy.item()
         })   
 
+        scheduler.step()
+
     return network, round_stats
 
 
@@ -221,9 +224,10 @@ def main():
     encoder.eval()
         
     model = torch.compile(TCNMLP(encoder).to(device))
-
     model.train()
+
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.05, total_iters=80)
 
     cache_path = Path(f"{script_dir}/sol_5m.csv")
     
@@ -243,7 +247,7 @@ def main():
     history_path = Path(f"{script_dir}/training_log.csv")
 
     for r in range (ROUNDS):
-        model, round_stats = ppo_training_loop(env, model, optimizer, EPISODES_PER_ROUND)
+        model, round_stats = ppo_training_loop(env, model, optimizer, scheduler, EPISODES_PER_ROUND)
         avg_reward = sum(s['reward'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
@@ -253,10 +257,10 @@ def main():
             stat['round'] = r
             history.append(stat)
 
-        if r % 10 == 0:
+        if (r + 1) % 10 == 0:
             pd.DataFrame(history).to_csv(history_path, index=False)
             torch.save(model.state_dict(), f"{script_dir}/models/TCNMLP.pt")
-            print(f"Round {r} completed. Model and training log data saved.")
+            print(f"Round {r + 1} completed. Model and training log data saved.")
 
 if __name__ == "__main__":
     main()
