@@ -13,8 +13,8 @@ symbol = 'SOL/USDT'
 timeframe = '5m'
 
 # hyperparameters
-ROUNDS = 100
-EPISODES_PER_ROUND = 15
+ROUNDS = 500
+EPISODES_PER_ROUND = 10
 
 LR = 3e-4
 
@@ -222,9 +222,16 @@ def main():
         param.requires_grad = False
 
     encoder.eval()
+
+    model_path = Path(f"{script_dir}/models/TCNMLP.pt")
         
     model = torch.compile(TCNMLP(encoder).to(device))
     model.train()
+
+    if model_path.exists():
+        load_existing_weights = input("do you want to use use the pre-trained model? y or n")
+        if load_existing_weights == "y":
+            model.load_state_dict(torch.load(model_path, map_location=device)
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
     scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=80)
