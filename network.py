@@ -127,19 +127,18 @@ class TradingEnv(gym.Env):
         return observations, {}
 
     def step(self, action: int) -> Tuple:
-        traded = action != self.active_state
-        
+        fee = 0
+        if action != self.active_state:
+            fee = -0.01
+
         self.idx_pos += 1
         self.steps_taken += 1
-        current_return = self.log_returns[self.idx_pos, 0]
 
-        transaction_cost = 0.0005 if traded else 0.0
+        market_return = self.log_returns[self.idx_pos, 0]
+    
+        reward = (market_return * 100) if action == 1 else 0
+        reward += fee
 
-        if action == 1:
-            reward = current_return - transaction_cost
-        else:
-            reward = -transaction_cost
-        
         self.active_state = action
 
         done = self.steps_taken >= self.max_steps
@@ -148,6 +147,7 @@ class TradingEnv(gym.Env):
             "chart": self.windows[self.idx_pos],
             "state": self.active_state
         }
+
         return observation, reward, done, False, {}
 
 def normalize_reward_data(df: pd.DataFrame):

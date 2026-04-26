@@ -227,7 +227,7 @@ def main():
     model.train()
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.05, total_iters=80)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=80)
 
     cache_path = Path(f"{script_dir}/sol_5m.csv")
     
@@ -251,7 +251,7 @@ def main():
         avg_reward = sum(s['reward'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
-        print(f"Round {r} | Avg Reward: {avg_reward:.4f} | Value Loss: {avg_v_loss:.6f}")
+        print(f"Round {r + 1} | Avg Reward: {avg_reward:.4f} | Value Loss: {avg_v_loss:.6f}")
         
         for stat in round_stats:
             stat['round'] = r
