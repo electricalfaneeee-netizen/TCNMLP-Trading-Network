@@ -13,12 +13,12 @@ symbol = 'SOL/USDT'
 timeframe = '5m'
 
 # hyperparameters
-ROUNDS = 500
+ROUNDS = 200
 EPISODES_PER_ROUND = 10
 
 LR = 3e-4
 
-PPO_EPOCHS = 8
+PPO_EPOCHS = 6
 CLIP_EPSILON = 0.06
 GAMMA = 0.99
 GAE_LAMBDA = 0.93
@@ -97,7 +97,7 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.92):
 
 def ppo_training_loop(env, network, optimizer, scheduler, episodes):
 
-    z_score_data = torch.tensor(env.windows, dtype=torch.float32, device=device)
+    z_score_data = env.windows
     round_stats = []
 
     for episode in range(episodes):
@@ -231,7 +231,7 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.05, total_iters=400)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=160)
 
     cache_path = Path(f"{script_dir}/sol_5m.csv")
     

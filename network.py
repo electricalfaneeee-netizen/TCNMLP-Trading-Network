@@ -122,7 +122,7 @@ class TradingEnv(gym.Env):
 
         observations = {
             "chart": self.windows[self.idx_pos],
-            "state": self.active_state
+            "state": torch.tensor([float(self.active_state), 0])
         }
 
         return observations, {}
@@ -138,7 +138,7 @@ class TradingEnv(gym.Env):
         self.idx_pos += 1
         self.steps_taken += 1
 
-        market_return = self.log_returns[self.idx_pos, 0]
+        market_return = self.log_returns[self.idx_pos, 0].item()
         reward = (market_return * 100) if action == 1 else 0
         reward += fee
 
