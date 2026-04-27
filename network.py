@@ -122,7 +122,7 @@ class TradingEnv(gym.Env):
 
         observations = {
             "chart": self.windows[self.idx_pos],
-            "state": torch.tensor([float(self.active_state), 0])
+            "state": torch.tensor([float(self.active_state), 0], dtype=torch.float32, device=device)
         }
 
         return observations, {}
