@@ -18,12 +18,12 @@ EPISODES_PER_ROUND = 10
 
 LR = 3e-4
 
-PPO_EPOCHS = 6
-CLIP_EPSILON = 0.07
+PPO_EPOCHS = 8
+CLIP_EPSILON = 0.06
 GAMMA = 0.99
-GAE_LAMBDA = 0.92
-ENTROPY_COEF = 0.02
-VALUE_COEF = 1
+GAE_LAMBDA = 0.93
+ENTROPY_COEF = 0.03
+VALUE_COEF = 0.8
 
 def yankSolanaData(start_date, end_date):
     # Parse dates to milliseconds timestamp
@@ -117,21 +117,17 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
         done = False
         
         while not done:
-            idx = env.idx_pos
-            
-            chart_tensor = torch.tensor(obs["chart"], dtype=torch.float32, device=device)
-            chart_slice = chart_tensor.T.unsqueeze(0)
-
-            pos_scalar = torch.tensor([obs["state"]], dtype=torch.long, device=device)
+            chart_slice = obs["chart"].T.unsqueeze(0)
+            state_tensor = obs["state"].unsqueeze(0)
             
             with torch.no_grad():
-                log_probs, value = network(chart_slice, pos_scalar)
+                log_probs, value = network(chart_slice, state_tensor)
             
             probs = torch.exp(log_probs).detach().cpu()
             action = torch.multinomial(probs, 1).item()
             
             batch_charts.append(chart_slice)
-            batch_pos.append(pos_scalar)
+            batch_pos.append(state_tensor)
             
             log_probs_list.append(log_probs.squeeze(0))
             values_list.append(value.squeeze())
@@ -159,7 +155,8 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
             last_idx = env.idx_pos
             if last_idx < len(z_score_data):
                 last_chart = z_score_data[last_idx].T.unsqueeze(0)
-                _, next_value = network(last_chart, pos_tensor[-1].unsqueeze(0))
+                last_state = obs["state"].unsqueeze(0)
+                _, next_value = network(last_chart, last_state)
                 next_value = next_value.squeeze()
             else:
                 next_value = torch.tensor(0.0, device=device)
@@ -229,12 +226,12 @@ def main():
     model.train()
 
     if model_path.exists():
-        load_existing_weights = input("do you want to use use the pre-trained model? y or n")
+        load_existing_weights = input("do you want to use use the pre-trained model? y or n\n")
         if load_existing_weights == "y":
-            model.load_state_dict(torch.load(model_path, map_location=device)
+            model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=80)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.05, total_iters=400)
 
     cache_path = Path(f"{script_dir}/sol_5m.csv")
     

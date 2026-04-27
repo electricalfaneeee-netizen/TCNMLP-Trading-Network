@@ -4,7 +4,6 @@ import gymnasium as gym
 from gymnasium import spaces
 import pandas as pd
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
 from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
@@ -32,17 +31,22 @@ class TCNMLP(nn.Module):
 
         self.encoder = encoder
 
-        self.MLP_stack = nn.Sequential(
-            nn.Linear(31, 64),
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(30, 64),
             nn.SiLU(),
             nn.Linear(64, 64),
             nn.SiLU(),
-            nn.Linear(64, 30),
+            nn.Linear(64, 32),
             nn.SiLU()
-         )
+        )
+
+        self.state_mlp = nn.Sequential(
+            nn.Linear(2, 16),
+            nn.SiLU()
+        )
 
         self.actor = nn.Sequential(
-            nn.Linear(61, 64),
+            nn.Linear(32 + 16, 64),
             nn.SiLU(),
             nn.Dropout(0.2),
             nn.Linear(64, 2),
@@ -50,23 +54,21 @@ class TCNMLP(nn.Module):
         )
 
         self.critic = nn.Sequential(
-            nn.Linear(61, 64),
+            nn.Linear(32 + 16, 64),
             nn.SiLU(),
             nn.Dropout(0.05),
             nn.Linear(64, 1)
         )
 
-    def forward(self, x, state):
-        encoded = self.encoder(x)
-        last_encoding = encoded[:, -1, :]
+    def forward(self, x, state_info):
+        encoded_features = self.encoder(x)
 
-        state_float = state.float()
-        encoded = torch.cat((last_encoding, state_float.unsqueeze(-1)), dim=-1)
+        chart_features = self.feature_mlp(encoded_features)
+        state_features = self.state_mlp(state_info)
 
-        encoded = torch.cat((self.MLP_stack(encoded), encoded), dim=-1)
-
-        policy = self.actor(encoded)
-        value = self.critic(encoded)
+        combined = torch.cat((chart_features, state_features), dim=-1)
+        policy = self.actor(combined)
+        value = self.critic(combined)
 
         return policy, value
 
@@ -89,9 +91,8 @@ class TradingEnv(gym.Env):
         v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
         windows[:, 4:, :] = (vol_slice - v_mean) / v_std
         
-        self.windows = windows
-
-        self.log_returns = normalize_reward_data(df)
+        self.windows = torch.tensor(windows, dtype=torch.float32, device=device)
+        self.log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
 
         self.action_space = spaces.Discrete(2)
 
@@ -131,21 +132,27 @@ class TradingEnv(gym.Env):
         if action != self.active_state:
             fee = -0.01
 
+        if action == 1 and self.active_state == 0:
+            self.entry_idx = self.idx_pos
+
         self.idx_pos += 1
         self.steps_taken += 1
 
         market_return = self.log_returns[self.idx_pos, 0]
-    
         reward = (market_return * 100) if action == 1 else 0
         reward += fee
 
-        self.active_state = action
+        if action == 1:
+            unrealized_pnl = torch.sum(self.log_returns[self.entry_idx:self.idx_pos + 1, 0]) * 100
+        else:
+            unrealized_pnl = 0.0
 
+        self.active_state = action
         done = self.steps_taken >= self.max_steps
         
         observation = {
             "chart": self.windows[self.idx_pos],
-            "state": self.active_state
+            "state": torch.tensor([float(self.active_state), float(unrealized_pnl)], dtype=torch.float32, device=device)
         }
 
         return observation, reward, done, False, {}
