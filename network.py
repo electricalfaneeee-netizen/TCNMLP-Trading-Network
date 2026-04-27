@@ -64,7 +64,7 @@ class TCNMLP(nn.Module):
         encoded_features = self.encoder(x)
 
         chart_features = self.feature_mlp(encoded_features)
-        state_features = self.state_mlp(state_info)
+        state_features = self.state_mlp(state_info).unsqueeze(1).expand(-1, chart_features.size(1), -1)
 
         combined = torch.cat((chart_features, state_features), dim=-1)
         policy = self.actor(combined)
