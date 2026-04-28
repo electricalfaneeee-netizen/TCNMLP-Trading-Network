@@ -61,41 +61,54 @@ class TCNMLP(nn.Module):
         )
 
     def forward(self, x, state_info):
+        x = x.transpose(1, 2)
         encoded_features = self.encoder(x)
-
+        
         chart_features = self.feature_mlp(encoded_features)
-        state_features = self.state_mlp(state_info).unsqueeze(1).expand(-1, chart_features.size(1), -1)
+        state_features = self.state_mlp(state_info) # [batch, state_features]
 
-        combined = torch.cat((chart_features, state_features), dim=-1)
+        current_chart_features = chart_features[:, -1, :]
+
+        combined = torch.cat((current_chart_features, state_features), dim=-1)
+
         policy = self.actor(combined)
         value = self.critic(combined)
 
         return policy, value
 
 class TradingEnv(gym.Env):
-    def __init__(self, df: pd.DataFrame, window_size=100, max_steps=3072):
+    def __init__(self, dfs: dict[str, pd.DataFrame], window_size=100, max_steps=3072):
         super().__init__()
-        self.raw_data = df.to_numpy().astype(np.float32)
-        self.window_size = window_size
-        
-        _windows = np.lib.stride_tricks.sliding_window_view(self.raw_data, window_shape=window_size, axis=0)
-        windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
-        
-        price_slice = windows[:, :4, :]
-        p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
-        p_std = price_slice.std(axis=(1, 2), keepdims=True) + 1e-9
-        windows[:, :4, :] = (price_slice - p_mean) / p_std
-        
-        vol_slice = windows[:, 4:, :]
-        v_mean = vol_slice.mean(axis=(1, 2), keepdims=True)
-        v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
-        windows[:, 4:, :] = (vol_slice - v_mean) / v_std
-        
-        self.windows = torch.tensor(windows, dtype=torch.float32, device=device)
-        self.log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
+
+        self.coin_vault = {}
+
+        for name, df in dfs.items():
+            raw_data = df.to_numpy().astype(np.float32)
+
+            _windows = np.lib.stride_tricks.sliding_window_view(raw_data, window_shape=window_size, axis=0)
+            windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+            
+            price_slice = windows[:, :4, :]
+            p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
+            p_std = price_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+            windows[:, :4, :] = (price_slice - p_mean) / p_std
+            
+            vol_slice = windows[:, 4:, :]
+            v_mean = vol_slice.mean(axis=(1, 2), keepdims=True)
+            v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+            windows[:, 4:, :] = (vol_slice - v_mean) / v_std
+            
+            windows = torch.tensor(windows, dtype=torch.float32, device=device)
+            log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
+
+            self.coin_vault[name] = {
+                "windows": windows,
+                "log_returns": log_returns
+            }
 
         self.action_space = spaces.Discrete(2)
 
+        self.window_size = window_size
         self.observation_space = spaces.Dict({
             "chart": spaces.Box(-np.inf, np.inf, shape=(self.window_size, 5), dtype=np.float32),
             "state": spaces.Discrete(2)
@@ -104,14 +117,20 @@ class TradingEnv(gym.Env):
         self.current_step = 0
         self.active_state = 0
         self.idx_pos = 0
-
         self.max_steps = max_steps
-        self.total_rows = len(self.windows)
+
+        self.coin_names = list(self.coin_vault.keys())
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        max_start = self.total_rows - self.max_steps - 1
+        selected_coin = np.random.choice(self.coin_names)
+        active_data = self.coin_vault[selected_coin]
+        
+        self.active_windows = active_data["windows"]
+        self.active_returns = active_data["log_returns"]
+
+        max_start = len(self.active_windows) - self.max_steps - 1
         self.start_idx = np.random.randint(self.window_size, max_start)
 
         self.current_step = 0
@@ -121,7 +140,7 @@ class TradingEnv(gym.Env):
         self.steps_taken = 0
 
         observations = {
-            "chart": self.windows[self.idx_pos],
+            "chart": self.active_windows[self.idx_pos],
             "state": torch.tensor([float(self.active_state), 0], dtype=torch.float32, device=device)
         }
 
@@ -130,7 +149,7 @@ class TradingEnv(gym.Env):
     def step(self, action: int) -> Tuple:
         fee = 0
         if action != self.active_state:
-            fee = -0.01
+            fee = -0.0001
 
         if action == 1 and self.active_state == 0:
             self.entry_idx = self.idx_pos
@@ -138,12 +157,12 @@ class TradingEnv(gym.Env):
         self.idx_pos += 1
         self.steps_taken += 1
 
-        market_return = self.log_returns[self.idx_pos, 0].item()
-        reward = (market_return * 100) if action == 1 else 0
+        market_return = self.active_returns[self.idx_pos, 0].item()
+        reward = market_return if action == 1 else 0
         reward += fee
 
         if action == 1:
-            unrealized_pnl = torch.sum(self.log_returns[self.entry_idx:self.idx_pos + 1, 0]) * 100
+            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0])
         else:
             unrealized_pnl = 0.0
 
@@ -151,7 +170,7 @@ class TradingEnv(gym.Env):
         done = self.steps_taken >= self.max_steps
         
         observation = {
-            "chart": self.windows[self.idx_pos],
+            "chart": self.active_windows[self.idx_pos],
             "state": torch.tensor([float(self.active_state), float(unrealized_pnl)], dtype=torch.float32, device=device)
         }
 

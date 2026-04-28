@@ -9,8 +9,8 @@ from torch.optim.lr_scheduler import LinearLR
 
 # environment variables
 exchange = ccxt.binance()
-symbol = 'SOL/USDT'
 timeframe = '5m'
+symbols = ["SOL/USDT", "AVAX/USDT", "APT/USDT", "ETH/USDT"]
 
 # hyperparameters
 ROUNDS = 200
@@ -18,14 +18,14 @@ EPISODES_PER_ROUND = 10
 
 LR = 3e-4
 
-PPO_EPOCHS = 6
-CLIP_EPSILON = 0.06
+PPO_EPOCHS = 8
+CLIP_EPSILON = 0.12
 GAMMA = 0.99
-GAE_LAMBDA = 0.93
-ENTROPY_COEF = 0.03
-VALUE_COEF = 0.8
+GAE_LAMBDA = 0.95
+ENTROPY_COEF = 0.02
+VALUE_COEF = 0.5
 
-def yankSolanaData(start_date, end_date):
+def yank5mMarketData(start_date, end_date, symbol):
     # Parse dates to milliseconds timestamp
     start_date = start_date
     end_date = end_date
@@ -77,7 +77,7 @@ def yankSolanaData(start_date, end_date):
     df = df.reset_index(drop=True)
     return df
 
-def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.92):
+def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     n = len(rewards)
     advantages = torch.zeros(n, device=device)
     last_gae_lam = 0
@@ -97,7 +97,6 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.92):
 
 def ppo_training_loop(env, network, optimizer, scheduler, episodes):
 
-    z_score_data = env.windows
     round_stats = []
 
     for episode in range(episodes):
@@ -117,13 +116,13 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
         done = False
         
         while not done:
-            chart_slice = obs["chart"].T.unsqueeze(0)
+            chart_slice = obs["chart"].unsqueeze(0)
             state_tensor = obs["state"].unsqueeze(0)
             
             with torch.no_grad():
                 log_probs, value = network(chart_slice, state_tensor)
             
-            probs = torch.exp(log_probs).detach().cpu()
+            probs = torch.exp(log_probs).squeeze().detach().cpu()
             action = torch.multinomial(probs, 1).item()
             
             batch_charts.append(chart_slice)
@@ -152,14 +151,14 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
         actions_tensor = torch.tensor(actions_list, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            last_idx = env.idx_pos
-            if last_idx < len(z_score_data):
-                last_chart = z_score_data[last_idx].T.unsqueeze(0)
-                last_state = obs["state"].unsqueeze(0)
-                _, next_value = network(last_chart, last_state)
-                next_value = next_value.squeeze()
+            if env.idx_pos < len(env.active_windows) - 1:
+                next_chart = env.active_windows[env.idx_pos + 1].unsqueeze(0)
+                next_state = obs["state"].unsqueeze(0) 
+                
+                _, next_value = network(next_chart, next_state)
+                next_value = next_value.item()
             else:
-                next_value = torch.tensor(0.0, device=device)
+                next_value = 0.0
 
         advantages, returns = compute_gae(
             rewards_tensor,
@@ -187,7 +186,11 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
             surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            value_loss = ((new_values - returns) ** 2).mean()
+            v_targ = returns
+            v_clipped = values_tensor + torch.clamp(new_values - values_tensor, -CLIP_EPSILON, CLIP_EPSILON)
+            v_loss1 = (new_values - v_targ) ** 2
+            v_loss2 = (v_clipped - v_targ) ** 2
+            value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
             entropy = -(torch.exp(new_log_probs) * new_log_probs).sum(dim=-1).mean()
 
@@ -195,7 +198,7 @@ def ppo_training_loop(env, network, optimizer, scheduler, episodes):
             optimizer.zero_grad()
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(network.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(network.parameters(), 0.3)
             
             optimizer.step()
 
@@ -231,21 +234,25 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=160)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=1600)
 
-    cache_path = Path(f"{script_dir}/sol_5m.csv")
+    dfs = {}
+
+    for symbol in symbols:
+
+        base_name = symbol.split("/")[0].lower()
+        path = Path(f"{script_dir}/{base_name}_5m.csv")
+
+        if path.exists():
+            print(f"Loading cached data for {symbol}...")
+            dfs[symbol] = pd.read_csv(path)
+        else:
+            print(f"Fetching data for {symbol}...")
+            df = yank5mMarketData('2023-01-01 00:00:00', '2025-12-31 23:59:59', symbol)
+            df.to_csv(path, index=False)
+            dfs[symbol] = df
     
-    if cache_path.exists():
-        print("Loading cached data...")
-        df = pd.read_csv(cache_path)
-    else:
-        print("Fetching Solana data...")
-        df = yankSolanaData('2023-01-01 00:00:00', '2025-12-31 23:59:59')
-        df.to_csv(cache_path, index=False)
-
-    print(f"Loaded {len(df)} candles")
-
-    env = TradingEnv(df, window_size=100, max_steps=3072)
+    env = TradingEnv(dfs, window_size=100, max_steps=3072)
 
     history = []
     history_path = Path(f"{script_dir}/training_log.csv")
