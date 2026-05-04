@@ -158,11 +158,11 @@ class TradingEnv(gym.Env):
         self.steps_taken += 1
 
         market_return = self.active_returns[self.idx_pos, 0].item()
-        reward = market_return if action == 1 else 0
+        reward = (market_return * 10) if action == 1 else 0
         reward += fee
 
         if action == 1:
-            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0])
+            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]) * 10
         else:
             unrealized_pnl = 0.0
 

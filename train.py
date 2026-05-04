@@ -3,18 +3,20 @@ import torch.optim as optim
 import ccxt
 import pandas as pd
 import time
+import gymnasium as gym
 from pathlib import Path
 from network import TCNMLP, TCNEncoder, TradingEnv, device, script_dir
 from torch.optim.lr_scheduler import LinearLR
 
-# environment variables
+# envsironment variables
 exchange = ccxt.binance()
 timeframe = '5m'
 symbols = ["SOL/USDT", "AVAX/USDT", "APT/USDT", "ETH/USDT"]
 
 # hyperparameters
-ROUNDS = 200
+ROUNDS = 1000
 EPISODES_PER_ROUND = 10
+NUM_ENVS = 10
 
 LR = 3e-4
 
@@ -95,82 +97,82 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     returns = advantages + values
     return advantages, returns
 
-def ppo_training_loop(env, network, optimizer, scheduler, episodes):
+def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
 
     round_stats = []
 
-    for episode in range(episodes):
-        obs, _ = env.reset()
-        
-        log_probs_list = []
-        values_list = []
-        actions_list = []
-        rewards_list = []
-        mask_list = []
-        
-        batch_charts = [] 
-        batch_pos = []
+    obs, _ = envs.reset()
+    
+    log_probs_list = []
+    values_list = []
+    actions_list = []
+    rewards_list = []
+    mask_list = []
+    
+    batch_charts = [] 
+    batch_pos = []
 
-        episode_reward = 0
+    episode_reward = 0
 
-        done = False
+    done = False
+    
+    while not done:
+        chart_slice = obs["chart"].unsqueeze(0)
+        state_tensor = obs["state"].unsqueeze(0)
         
-        while not done:
-            chart_slice = obs["chart"].unsqueeze(0)
-            state_tensor = obs["state"].unsqueeze(0)
-            
+        with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             with torch.no_grad():
                 log_probs, value = network(chart_slice, state_tensor)
             
-            probs = torch.exp(log_probs).squeeze().detach().cpu()
-            action = torch.multinomial(probs, 1).item()
+                probs = torch.exp(log_probs)
+                actions = torch.multinomial(probs, 1).squeeze()
+        
+        batch_charts.append(chart_slice)
+        batch_pos.append(state_tensor)
+        
+        log_probs_list.append(log_probs.squeeze(0))
+        values_list.append(value.squeeze())
+        actions_list.append(actions)
+        
+        new_obs, rewards, terms, truncs, _ = envs.step(actions.cpu().numpy())
+        done = terms or truncs
+        mask = 0.0 if terms else 1.0
+        mask_list.append(mask)           
+        rewards_list.append(rewards)
+
+        episode_reward += rewards
+        obs = new_obs
+
+    charts_tensor = torch.cat(batch_charts)
+    pos_tensor = torch.cat(batch_pos)
+
+    values_tensor = torch.stack(values_list).detach()
+    old_log_probs = torch.stack(log_probs_list).detach()
+    rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32, device=device)
+    masks_tensor = torch.tensor(mask_list, dtype=torch.float32, device=device)
+    actions_tensor = torch.tensor(actions_list, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        if envs.idx_pos < len(envs.active_windows) - 1:
+            next_chart = envs.active_windows[envs.idx_pos + 1].unsqueeze(0)
+            next_state = obs["state"].unsqueeze(0) 
             
-            batch_charts.append(chart_slice)
-            batch_pos.append(state_tensor)
-            
-            log_probs_list.append(log_probs.squeeze(0))
-            values_list.append(value.squeeze())
-            actions_list.append(action)
-            
-            new_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            mask = 0.0 if terminated else 1.0
-            mask_list.append(mask)           
-            rewards_list.append(reward)
+            _, next_value = network(next_chart, next_state)
+            next_value = next_value.item()
+        else:
+            next_value = 0.0
 
-            episode_reward += reward
-            obs = new_obs
+    advantages, returns = compute_gae(
+        rewards_tensor,
+        values_tensor,
+        next_value,
+        masks_tensor,
+        GAMMA,
+        GAE_LAMBDA
+    )
 
-        charts_tensor = torch.cat(batch_charts)
-        pos_tensor = torch.cat(batch_pos)
-
-        values_tensor = torch.stack(values_list).detach()
-        old_log_probs = torch.stack(log_probs_list).detach()
-        rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32, device=device)
-        masks_tensor = torch.tensor(mask_list, dtype=torch.float32, device=device)
-        actions_tensor = torch.tensor(actions_list, dtype=torch.long, device=device)
-
-        with torch.no_grad():
-            if env.idx_pos < len(env.active_windows) - 1:
-                next_chart = env.active_windows[env.idx_pos + 1].unsqueeze(0)
-                next_state = obs["state"].unsqueeze(0) 
-                
-                _, next_value = network(next_chart, next_state)
-                next_value = next_value.item()
-            else:
-                next_value = 0.0
-
-        advantages, returns = compute_gae(
-            rewards_tensor,
-            values_tensor,
-            next_value,
-            masks_tensor,
-            GAMMA,
-            GAE_LAMBDA
-        )
-
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    if advantages.numel() > 1:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in range(PPO_EPOCHS):
             new_log_probs, new_values = network(charts_tensor, pos_tensor)
@@ -234,7 +236,7 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=1600)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=10000)
 
     dfs = {}
 
@@ -252,13 +254,13 @@ def main():
             df.to_csv(path, index=False)
             dfs[symbol] = df
     
-    env = TradingEnv(dfs, window_size=100, max_steps=3072)
+    envs = gym.vector.SyncVectorEnv([lambda: TradingEnv(dfs, window_size=100, max_steps=3072) for _ in range(NUM_ENVS)])
 
     history = []
     history_path = Path(f"{script_dir}/training_log.csv")
 
     for r in range (ROUNDS):
-        model, round_stats = ppo_training_loop(env, model, optimizer, scheduler, EPISODES_PER_ROUND)
+        model, round_stats = ppo_training_loop(envs, model, optimizer, scheduler, EPISODES_PER_ROUND)
         avg_reward = sum(s['reward'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
