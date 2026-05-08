@@ -1,3 +1,4 @@
+from ccxt.xt import Num
 import torch
 import torch.optim as optim
 import ccxt
@@ -81,7 +82,7 @@ def yank5mMarketData(start_date, end_date, symbol):
 
 def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     n = len(rewards)
-    advantages = torch.zeros(n, device=device)
+    advantages = torch.zeros((n, NUM_ENVS), device=device)
     last_gae_lam = 0
     
     next_v = next_value
@@ -103,64 +104,45 @@ def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
 
     obs, _ = envs.reset()
     
-    log_probs_list = []
-    values_list = []
-    actions_list = []
-    rewards_list = []
-    mask_list = []
-    
-    batch_charts = [] 
-    batch_pos = []
+    old_log_probs = torch.zeros((3072, NUM_ENVS, 2), device=device)
+    values_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+    rewards_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+    masks_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+
+    charts_tensor = torch.zeros((3072, NUM_ENVS, 5, 100), device=device)
+    states_tensor = torch.zeros((3072, NUM_ENVS, 2), device=device)
 
     episode_reward = 0
 
-    done = False
-    
-    while not done:
-        chart_slice = obs["chart"].unsqueeze(0)
-        state_tensor = obs["state"].unsqueeze(0)
-        
+    for step in range(3072):
         with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             with torch.no_grad():
-                log_probs, value = network(chart_slice, state_tensor)
+                log_probs, values = network(obs["chart"], obs["state"])
             
                 probs = torch.exp(log_probs)
                 actions = torch.multinomial(probs, 1).squeeze()
         
-        batch_charts.append(chart_slice)
-        batch_pos.append(state_tensor)
-        
-        log_probs_list.append(log_probs.squeeze(0))
-        values_list.append(value.squeeze())
-        actions_list.append(actions)
-        
-        new_obs, rewards, terms, truncs, _ = envs.step(actions.cpu().numpy())
-        done = terms or truncs
-        mask = 0.0 if terms else 1.0
-        mask_list.append(mask)           
-        rewards_list.append(rewards)
+        charts_tensor[step] = obs["chart"].detach()
+        states_tensor[step] = obs["state"].detach()
 
+        old_log_probs[step] = log_probs.detach()
+        values_tensor[step] = values.detach()
+        actions_tensor[step] = actions.detach()
+        
+        new_obs, rewards, terms, truncs, _ = envs.step(actions)
+        masks_tensor[step] = torch.tensor(1.0 - (terms | truncs), device=device)
+        rewards_tensor[step] = torch.tensor(rewards, dtype=torch.float32, device=device)
         episode_reward += rewards
         obs = new_obs
 
-    charts_tensor = torch.cat(batch_charts)
-    pos_tensor = torch.cat(batch_pos)
-
-    values_tensor = torch.stack(values_list).detach()
-    old_log_probs = torch.stack(log_probs_list).detach()
-    rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32, device=device)
-    masks_tensor = torch.tensor(mask_list, dtype=torch.float32, device=device)
-    actions_tensor = torch.tensor(actions_list, dtype=torch.long, device=device)
-
-    with torch.no_grad():
-        if envs.idx_pos < len(envs.active_windows) - 1:
-            next_chart = envs.active_windows[envs.idx_pos + 1].unsqueeze(0)
-            next_state = obs["state"].unsqueeze(0) 
+    with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+        with torch.no_grad():
+            chart_input = torch.as_tensor(obs["chart"], device=device)
+            state_input = torch.as_tensor(obs["state"], device=device)
             
-            _, next_value = network(next_chart, next_state)
-            next_value = next_value.item()
-        else:
-            next_value = 0.0
+            _, next_value = network(chart_input, state_input)
+            next_value = next_value.squeeze()
 
     advantages, returns = compute_gae(
         rewards_tensor,
@@ -171,11 +153,22 @@ def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
         GAE_LAMBDA
     )
 
+    old_log_probs = old_log_probs.reshape(-1, 2)
+    values_tensor = values_tensor.reshape(-1)
+    actions_tensor = actions_tensor.reshape(-1)
+
+    charts_tensor = charts_tensor.reshape(-1, 5, 100)
+    states_tensor = states_tensor.reshape(-1, 2)
+
+    advantages = advantages.reshape(-1)
+    returns = returns.reshape(-1)
+
+
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         for epoch in range(PPO_EPOCHS):
-            new_log_probs, new_values = network(charts_tensor, pos_tensor)
+            new_log_probs, new_values = network(charts_tensor, states_tensor)
 
             new_values = new_values.squeeze()
 
@@ -212,6 +205,8 @@ def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
         })   
 
         scheduler.step()
+
+    torch.xpu.empty_cache()
 
     return network, round_stats
 
