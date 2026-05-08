@@ -16,7 +16,6 @@ symbols = ["SOL/USDT", "AVAX/USDT", "APT/USDT", "ETH/USDT"]
 
 # hyperparameters
 ROUNDS = 1000
-EPISODES_PER_ROUND = 10
 NUM_ENVS = 10
 
 LR = 3e-4
@@ -98,7 +97,9 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     returns = advantages + values
     return advantages, returns
 
-def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
+compute_gae = torch.compile(compute_gae)
+
+def ppo_training_loop(envs, network, optimizer, scheduler):
 
     round_stats = []
 
@@ -123,16 +124,16 @@ def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
                 probs = torch.exp(log_probs)
                 actions = torch.multinomial(probs, 1).squeeze()
         
-        charts_tensor[step] = obs["chart"].detach()
-        states_tensor[step] = obs["state"].detach()
+        charts_tensor[step].copy_(obs["chart"])
+        states_tensor[step].copy_(obs["state"])
 
-        old_log_probs[step] = log_probs.detach()
-        values_tensor[step] = values.detach()
-        actions_tensor[step] = actions.detach()
+        old_log_probs[step].copy_(log_probs)
+        values_tensor[step].copy_(values)
+        actions_tensor[step].copy_(actions)
         
         new_obs, rewards, terms, truncs, _ = envs.step(actions)
-        masks_tensor[step] = torch.tensor(1.0 - (terms | truncs), device=device)
-        rewards_tensor[step] = torch.tensor(rewards, dtype=torch.float32, device=device)
+        masks_tensor[step].copy_(torch.as_tensor(1.0 - (terms | truncs), dtype=torch.float32))
+        rewards_tensor[step].copy_(torch.as_tensor(rewards, dtype=torch.float32))
         episode_reward += rewards
         obs = new_obs
 
@@ -167,44 +168,45 @@ def ppo_training_loop(envs, network, optimizer, scheduler, episodes):
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        for epoch in range(PPO_EPOCHS):
-            new_log_probs, new_values = network(charts_tensor, states_tensor)
+        with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+            for epoch in range(PPO_EPOCHS):
+                new_log_probs, new_values = network(charts_tensor, states_tensor)
 
-            new_values = new_values.squeeze()
+                new_values = new_values.squeeze()
 
-            current_log_probs = new_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
-            old_action_log_probs = old_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
+                current_log_probs = new_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
+                old_action_log_probs = old_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
 
-            ratio = torch.exp(current_log_probs - old_action_log_probs)
+                ratio = torch.exp(current_log_probs - old_action_log_probs)
 
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-            v_targ = returns
-            v_clipped = values_tensor + torch.clamp(new_values - values_tensor, -CLIP_EPSILON, CLIP_EPSILON)
-            v_loss1 = (new_values - v_targ) ** 2
-            v_loss2 = (v_clipped - v_targ) ** 2
-            value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                v_targ = returns
+                v_clipped = values_tensor + torch.clamp(new_values - values_tensor, -CLIP_EPSILON, CLIP_EPSILON)
+                v_loss1 = (new_values - v_targ) ** 2
+                v_loss2 = (v_clipped - v_targ) ** 2
+                value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
-            entropy = -(torch.exp(new_log_probs) * new_log_probs).sum(dim=-1).mean()
+                entropy = -(torch.exp(new_log_probs) * new_log_probs).sum(dim=-1).mean()
 
-            loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
-            optimizer.zero_grad()
-            loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(network.parameters(), 0.3)
-            
-            optimizer.step()
+                loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
+                optimizer.zero_grad()
+                loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(network.parameters(), 0.3)
+                
+                optimizer.step()
 
-        round_stats.append({
-                "reward": episode_reward,
-                "policy_loss": policy_loss.item(),
-                "value_loss": value_loss.item(),
-                "entropy": entropy.item()
-        })   
+            round_stats.append({
+                    "reward": episode_reward,
+                    "policy_loss": policy_loss.item(),
+                    "value_loss": value_loss.item(),
+                    "entropy": entropy.item()
+            })   
 
-        scheduler.step()
+    scheduler.step()
 
     torch.xpu.empty_cache()
 
@@ -231,7 +233,7 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=10000)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=1000)
 
     dfs = {}
 
@@ -255,7 +257,7 @@ def main():
     history_path = Path(f"{script_dir}/training_log.csv")
 
     for r in range (ROUNDS):
-        model, round_stats = ppo_training_loop(envs, model, optimizer, scheduler, EPISODES_PER_ROUND)
+        model, round_stats = ppo_training_loop(envs, model, optimizer, scheduler)
         avg_reward = sum(s['reward'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
