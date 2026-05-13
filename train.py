@@ -199,12 +199,12 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
                 
                 optimizer.step()
 
-            round_stats.append({
-                    "reward": episode_reward,
-                    "policy_loss": policy_loss.item(),
-                    "value_loss": value_loss.item(),
-                    "entropy": entropy.item()
-            })   
+        round_stats.append({
+                "reward": episode_reward,
+                "policy_loss": policy_loss.item(),
+                "value_loss": value_loss.item(),
+                "entropy": entropy.item()
+        })   
 
     scheduler.step()
 

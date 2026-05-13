@@ -60,12 +60,16 @@ class TCNMLP(nn.Module):
             nn.Linear(64, 1)
         )
 
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4)
+        self.transformer = nn.TransformerEncoder(self.encoder_layer, 2)
+
     def forward(self, x, state_info):
         x = x.transpose(1, 2)
         encoded_features = self.encoder(x)
+        transformer_features = self.transformer(encoded_features)
         
-        chart_features = self.feature_mlp(encoded_features)
-        state_features = self.state_mlp(state_info) # [batch, state_features]
+        chart_features = self.feature_mlp(transformer_features)
+        state_features = self.state_mlp(state_info)
 
         current_chart_features = chart_features[:, -1, :]
 
