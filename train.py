@@ -1,4 +1,3 @@
-from ccxt.xt import Num
 import torch
 import torch.optim as optim
 import ccxt
@@ -119,7 +118,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
     for step in range(3072):
         with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             with torch.no_grad():
-                log_probs, values = network(obs["chart"], obs["state"])
+                log_probs, values = network(obs["chart"], obs["state"], obs["unrealized_pnl"])
             
                 probs = torch.exp(log_probs)
                 actions = torch.multinomial(probs, 1).squeeze()
@@ -131,10 +130,10 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
         values_tensor[step].copy_(values)
         actions_tensor[step].copy_(actions)
         
-        new_obs, rewards, terms, truncs, _ = envs.step(actions)
+        new_obs, rewards, terms, truncs, info = envs.step(actions.detach().cpu().numpy())
         masks_tensor[step].copy_(torch.as_tensor(1.0 - (terms | truncs), dtype=torch.float32))
         rewards_tensor[step].copy_(torch.as_tensor(rewards, dtype=torch.float32))
-        episode_reward += rewards
+        episode_reward += info["returns"]
         obs = new_obs
 
     with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
