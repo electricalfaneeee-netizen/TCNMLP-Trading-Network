@@ -2,16 +2,17 @@ import torch
 import torch.optim as optim
 import ccxt
 import pandas as pd
+import numpy as np
 import time
 import gymnasium as gym
 from pathlib import Path
-from network import TCNMLP, TCNEncoder, TradingEnv, device, script_dir
+from network import TCNMLP, TCNEncoder, TradingEnv, normalize_reward_data, device, script_dir
 from torch.optim.lr_scheduler import LinearLR
 
 # envsironment variables
 exchange = ccxt.binance()
 timeframe = '5m'
-symbols = ["SOL/USDT", "AVAX/USDT", "APT/USDT", "ETH/USDT"]
+symbols = ["SOL/USDT", "AVAX/USDT", "RAY/USDT", "ETH/USDT"]
 
 # hyperparameters
 ROUNDS = 1000
@@ -19,7 +20,7 @@ NUM_ENVS = 10
 
 LR = 3e-4
 
-PPO_EPOCHS = 8
+PPO_EPOCHS = 6
 CLIP_EPSILON = 0.12
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -249,8 +250,34 @@ def main():
             df = yank5mMarketData('2023-01-01 00:00:00', '2025-12-31 23:59:59', symbol)
             df.to_csv(path, index=False)
             dfs[symbol] = df
+
+    coin_vault = {}
+
+    for name, df in dfs.items():
+        raw_data = df.to_numpy().astype(np.float32)
+
+        _windows = np.lib.stride_tricks.sliding_window_view(raw_data, window_shape=100, axis=0)
+        windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+        
+        price_slice = windows[:, :4, :]
+        p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
+        p_std = price_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+        windows[:, :4, :] = (price_slice - p_mean) / p_std
+        
+        vol_slice = windows[:, 4:, :]
+        v_mean = vol_slice.mean(axis=(1, 2), keepdims=True)
+        v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
+        windows[:, 4:, :] = (vol_slice - v_mean) / v_std
+        
+        windows = torch.tensor(windows, dtype=torch.float32, device=device)
+        log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
+
+        coin_vault[name] = {
+            "windows": windows,
+            "log_returns": log_returns
+        }
     
-    envs = gym.vector.SyncVectorEnv([lambda: TradingEnv(dfs, window_size=100, max_steps=3072) for _ in range(NUM_ENVS)])
+    envs = gym.vector.SyncVectorEnv([lambda: TradingEnv(coin_vault, window_size=100, max_steps=3072) for _ in range(NUM_ENVS)])
 
     history = []
     history_path = Path(f"{script_dir}/training_log.csv")

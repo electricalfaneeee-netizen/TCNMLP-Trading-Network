@@ -4,12 +4,13 @@ import gymnasium as gym
 from gymnasium import spaces
 import pandas as pd
 import numpy as np
-
-from Documents.python.neural_networks.TCNMLP_trading_network.train import NUM_ENVS
+from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
 
-class TCNEmbedder(nn.Module):
+script_dir = Path(__file__).resolve().parent
+
+class TCNEncoder(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -26,7 +27,7 @@ class TCNEmbedder(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).transpose(1, 2)
+        return self.net(x).transpose(-1, -2)
 
 class TCNMLP(nn.Module):
     def __init__(self, encoder):
@@ -85,7 +86,7 @@ class TCNMLP(nn.Module):
         self.maxpool = nn.AdaptiveMaxPool1d(1)
 
     def forward(self, x, state, unrealized_pnl):
-        x = x.transpose(1, 2)
+        x = np.swapaxes(x, -1, -2)
         encoded_features = self.encoder(x)
 
         seq_len = encoded_features.size(1)
@@ -111,42 +112,18 @@ class TCNMLP(nn.Module):
         return policy, value
 
 class TradingEnv(gym.Env):
-    def __init__(self, dfs: dict[str, pd.DataFrame], window_size=100, max_steps=3072):
+    def __init__(self, coin_vault, window_size=100, max_steps=3072):
         super().__init__()
 
-        self.coin_vault = {}
-
-        for name, df in dfs.items():
-            raw_data = df.to_numpy().astype(np.float32)
-
-            _windows = np.lib.stride_tricks.sliding_window_view(raw_data, window_shape=window_size, axis=0)
-            windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
-            
-            price_slice = windows[:, :4, :]
-            p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
-            p_std = price_slice.std(axis=(1, 2), keepdims=True) + 1e-9
-            windows[:, :4, :] = (price_slice - p_mean) / p_std
-            
-            vol_slice = windows[:, 4:, :]
-            v_mean = vol_slice.mean(axis=(1, 2), keepdims=True)
-            v_std = vol_slice.std(axis=(1, 2), keepdims=True) + 1e-9
-            windows[:, 4:, :] = (vol_slice - v_mean) / v_std
-            
-            windows = torch.tensor(windows, dtype=torch.float32, device=device)
-            log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
-
-            self.coin_vault[name] = {
-                "windows": windows,
-                "log_returns": log_returns
-            }
+        self.coin_vault = coin_vault
 
         self.action_space = spaces.Discrete(2)
 
         self.window_size = window_size
         self.observation_space = spaces.Dict({
-            "chart": spaces.Box(-np.inf, np.inf, shape=(5, self.window_size), dtype=np.float32),
-            "state": spaces.Discrete(2),
-            "unrealized_pnl": spaces.Box(-np.inf, np.inf, shape=(), dtype=np.float32)
+            "chart": spaces.Box(-np.inf, np.inf, shape=(self.window_size, 5), dtype=np.float32),
+            "state": spaces.Box(0, 1, shape=(1,), dtype=np.float32),
+            "unrealized_pnl": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
         })
         
         self.current_step = 0
@@ -186,9 +163,9 @@ class TradingEnv(gym.Env):
         self.sigma = 0
 
         observations = {
-            "chart": self.active_windows[self.idx_pos].cpu().numpy(),
-            "state": self.active_state,
-            "unrealized_pnl": 0,
+            "chart": self.active_windows[self.idx_pos].cpu().numpy().astype(np.float32),
+            "state": np.array([self.active_state], dtype=np.float32),
+            "unrealized_pnl": np.array([0.0], dtype=np.float32)
         }
 
         return observations, {}
@@ -220,7 +197,7 @@ class TradingEnv(gym.Env):
         returns += fee
 
         if action == 1:
-            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]) * 10
+            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item() * 10
         else:
             unrealized_pnl = 0.0
 
@@ -228,9 +205,9 @@ class TradingEnv(gym.Env):
         done = self.steps_taken >= self.max_steps
         
         observation = {
-            "chart": self.active_windows[self.idx_pos].cpu().numpy(),
-            "state": self.active_state,
-            "unrealized_pnl": unrealized_pnl.item(),
+            "chart": self.active_windows[self.idx_pos].cpu().numpy().astype(np.float32),
+            "state": np.array([self.active_state], dtype=np.float32),
+            "unrealized_pnl": np.array([unrealized_pnl], dtype=np.float32)
         }
 
         info = {
