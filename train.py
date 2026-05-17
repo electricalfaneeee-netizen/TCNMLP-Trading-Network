@@ -24,7 +24,7 @@ PPO_EPOCHS = 6
 CLIP_EPSILON = 0.12
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-ENTROPY_COEF = 0.02
+ENTROPY_COEF = 0.015
 VALUE_COEF = 0.5
 
 def yank5mMarketData(start_date, end_date, symbol):
@@ -107,7 +107,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
     
     old_log_probs = torch.zeros((3072, NUM_ENVS, 2), device=device, dtype=torch.bfloat16)
     values_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
-    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
+    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device)
     rewards_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
     masks_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
 
@@ -172,47 +172,72 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        total_p_loss = 0
+        total_v_loss = 0
+        total_entropy = 0
+        update_steps = 0
+
         with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             for epoch in range(PPO_EPOCHS):
-                new_log_probs, new_values = network(charts_tensor, states_tensor, unrealized_pnls_tensor)
 
-                new_values = new_values.squeeze()
+                batch_size = 3072 * NUM_ENVS
+                mini_batch_size = 512
 
-                current_log_probs = new_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
-                old_action_log_probs = old_log_probs.gather(1, actions_tensor.unsqueeze(1)).squeeze()
+                indices = torch.randperm(batch_size, device=device)
 
-                ratio = torch.exp(current_log_probs - old_action_log_probs)
+                for start in range(0, batch_size, mini_batch_size):
+                    end = start + mini_batch_size
+                    mb_idx = indices[start:end]
 
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                    mb_old_log_probs = old_log_probs[mb_idx]
+                    mb_values = values_tensor[mb_idx]
+                    mb_actions = actions_tensor[mb_idx].long()
+                    mb_advantages = advantages[mb_idx]
+                    mb_returns = returns[mb_idx]
 
-                v_targ = returns
-                v_clipped = values_tensor + torch.clamp(new_values - values_tensor, -CLIP_EPSILON, CLIP_EPSILON)
-                v_loss1 = (new_values - v_targ) ** 2
-                v_loss2 = (v_clipped - v_targ) ** 2
-                value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                    optimizer.zero_grad()
 
-                entropy = -(torch.exp(new_log_probs) * new_log_probs).sum(dim=-1).mean()
+                    new_log_probs, new_values = network(charts_tensor[mb_idx], states_tensor[mb_idx], unrealized_pnls_tensor[mb_idx])
 
-                loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
-                optimizer.zero_grad()
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(network.parameters(), 0.3)
-                
-                optimizer.step()
+                    new_values = new_values.squeeze()
+
+                    current_log_probs = new_log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze()
+                    old_action_log_probs = mb_old_log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze()
+
+                    ratio = torch.exp(current_log_probs - old_action_log_probs)
+
+                    surr1 = ratio * mb_advantages
+                    surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * mb_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    v_targ = mb_returns
+                    v_clipped = mb_values + torch.clamp(new_values - mb_values, -CLIP_EPSILON, CLIP_EPSILON)
+                    v_loss1 = (new_values - v_targ) ** 2
+                    v_loss2 = (v_clipped - v_targ) ** 2
+                    value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+
+                    entropy = -(torch.exp(new_log_probs) * new_log_probs).sum(dim=-1).mean()
+
+                    loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
+                    loss.backward()
+                    
+                    torch.nn.utils.clip_grad_norm_(network.parameters(), 0.3)
+                    
+                    optimizer.step()
+
+                    total_p_loss += policy_loss.item()
+                    total_v_loss += value_loss.item()
+                    total_entropy += entropy.item()
+                    update_steps += 1
 
         round_stats.append({
-                "returns": episode_returns,
-                "policy_loss": policy_loss.item(),
-                "value_loss": value_loss.item(),
-                "entropy": entropy.item()
+                "returns": episode_returns / NUM_ENVS,
+                "policy_loss": total_p_loss / update_steps,
+                "value_loss": total_v_loss / update_steps,
+                "entropy": total_entropy / update_steps
         })   
 
     scheduler.step()
-
-    torch.xpu.empty_cache()
 
     return network, round_stats
 
@@ -261,6 +286,8 @@ def main():
         raw_data = df.to_numpy().astype(np.float32)
 
         _windows = np.lib.stride_tricks.sliding_window_view(raw_data, window_shape=100, axis=0)
+        print(_windows.shape)
+
         windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
         
         price_slice = windows[:, :4, :]
