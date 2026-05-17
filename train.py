@@ -97,52 +97,55 @@ def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
     returns = advantages + values
     return advantages, returns
 
-compute_gae = torch.compile(compute_gae)
-
 def ppo_training_loop(envs, network, optimizer, scheduler):
+
+    torch.xpu.empty_cache()
 
     round_stats = []
 
     obs, _ = envs.reset()
     
-    old_log_probs = torch.zeros((3072, NUM_ENVS, 2), device=device)
-    values_tensor = torch.zeros((3072, NUM_ENVS), device=device)
-    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device)
-    rewards_tensor = torch.zeros((3072, NUM_ENVS), device=device)
-    masks_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+    old_log_probs = torch.zeros((3072, NUM_ENVS, 2), device=device, dtype=torch.bfloat16)
+    values_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
+    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
+    rewards_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
+    masks_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
 
-    charts_tensor = torch.zeros((3072, NUM_ENVS, 5, 100), device=device)
-    states_tensor = torch.zeros((3072, NUM_ENVS, 2), device=device)
+    charts_tensor = torch.zeros((3072, NUM_ENVS, 5, 100), device=device, dtype=torch.bfloat16)
+    states_tensor = torch.zeros((3072, NUM_ENVS, 2), device=device, dtype=torch.bfloat16)
+    unrealized_pnls_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
 
-    episode_reward = 0
+    episode_returns = 0.0
 
     for step in range(3072):
         with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             with torch.no_grad():
-                log_probs, values = network(obs["chart"], obs["state"], obs["unrealized_pnl"])
+                log_probs, values = network(torch.as_tensor(obs["chart"], device=device, dtype=torch.bfloat16), torch.as_tensor(obs["state"], device=device, dtype=torch.bfloat16), torch.as_tensor(obs["unrealized_pnl"], device=device, dtype=torch.bfloat16))
             
                 probs = torch.exp(log_probs)
                 actions = torch.multinomial(probs, 1).squeeze()
         
-        charts_tensor[step].copy_(obs["chart"])
-        states_tensor[step].copy_(obs["state"])
+        charts_tensor[step].copy_(torch.from_numpy(obs["chart"]))
+        states_tensor[step].copy_(torch.from_numpy(obs["state"]))
+        unrealized_pnls_tensor[step].copy_(torch.from_numpy(obs["unrealized_pnl"]).squeeze())
 
         old_log_probs[step].copy_(log_probs)
-        values_tensor[step].copy_(values)
+        values_tensor[step].copy_(values.squeeze())
         actions_tensor[step].copy_(actions)
         
         new_obs, rewards, terms, truncs, info = envs.step(actions.detach().cpu().numpy())
         masks_tensor[step].copy_(torch.as_tensor(1.0 - (terms | truncs), dtype=torch.float32))
         rewards_tensor[step].copy_(torch.as_tensor(rewards, dtype=torch.float32))
-        episode_reward += info["returns"]
+        episode_returns += info["returns"]
         obs = new_obs
 
     with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
         with torch.no_grad():
-            chart_input = torch.as_tensor(obs["chart"], device=device)
-            state_input = torch.as_tensor(obs["state"], device=device)
+            chart_input = torch.as_tensor(obs["chart"], device=device, dtype=torch.bfloat16)
+            state_input = torch.as_tensor(obs["state"], device=device, dtype=torch.bfloat16)
+            unrealized_pnl_input = torch.as_tensor(obs["unrealized_pnl"], device=device, dtype=torch.bfloat16)
             
-            _, next_value = network(chart_input, state_input)
+            _, next_value = network(chart_input, state_input, unrealized_pnl_input)
             next_value = next_value.squeeze()
 
     advantages, returns = compute_gae(
@@ -160,6 +163,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
 
     charts_tensor = charts_tensor.reshape(-1, 5, 100)
     states_tensor = states_tensor.reshape(-1, 2)
+    unrealized_pnls_tensor = unrealized_pnls_tensor.reshape(-1)
 
     advantages = advantages.reshape(-1)
     returns = returns.reshape(-1)
@@ -170,7 +174,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
 
         with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
             for epoch in range(PPO_EPOCHS):
-                new_log_probs, new_values = network(charts_tensor, states_tensor)
+                new_log_probs, new_values = network(charts_tensor, states_tensor, unrealized_pnls_tensor)
 
                 new_values = new_values.squeeze()
 
@@ -200,7 +204,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
                 optimizer.step()
 
         round_stats.append({
-                "reward": episode_reward,
+                "returns": episode_returns,
                 "policy_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
                 "entropy": entropy.item()
@@ -272,10 +276,14 @@ def main():
         windows = torch.tensor(windows, dtype=torch.float32, device=device)
         log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
 
+        windows = windows.transpose(-1, -2)
+
         coin_vault[name] = {
             "windows": windows,
             "log_returns": log_returns
         }
+
+    print(f"Vault shape: {coin_vault[list(coin_vault.keys())[0]]['windows'].shape}")
     
     envs = gym.vector.SyncVectorEnv([lambda: TradingEnv(coin_vault, window_size=100, max_steps=3072) for _ in range(NUM_ENVS)])
 
@@ -284,10 +292,10 @@ def main():
 
     for r in range (ROUNDS):
         model, round_stats = ppo_training_loop(envs, model, optimizer, scheduler)
-        avg_reward = sum(s['reward'] for s in round_stats) / len(round_stats)
+        avg_returns = sum(s['returns'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
-        print(f"Round {r + 1} | Avg Reward: {avg_reward:.4f} | Value Loss: {avg_v_loss:.6f}")
+        print(f"Round {r + 1} | Avg Returns: {avg_returns:.4f} | Value Loss: {avg_v_loss:.6f}")
         
         for stat in round_stats:
             stat['round'] = r

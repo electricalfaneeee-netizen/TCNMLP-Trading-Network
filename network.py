@@ -86,7 +86,6 @@ class TCNMLP(nn.Module):
         self.maxpool = nn.AdaptiveMaxPool1d(1)
 
     def forward(self, x, state, unrealized_pnl):
-        x = np.swapaxes(x, -1, -2)
         encoded_features = self.encoder(x)
 
         seq_len = encoded_features.size(1)
@@ -104,7 +103,7 @@ class TCNMLP(nn.Module):
         max_pool = self.maxpool(chart_features.transpose(1, 2)).squeeze(-1)
         last_step = chart_features[:, -1, :]
 
-        combined = torch.cat((avg_pool, max_pool, last_step, state_features), dim=-1)
+        combined = torch.cat((avg_pool, max_pool, last_step, state_features.squeeze(1)), dim=-1)
 
         policy = self.actor(combined)
         value = self.critic(combined)
@@ -121,7 +120,7 @@ class TradingEnv(gym.Env):
 
         self.window_size = window_size
         self.observation_space = spaces.Dict({
-            "chart": spaces.Box(-np.inf, np.inf, shape=(self.window_size, 5), dtype=np.float32),
+            "chart": spaces.Box(-np.inf, np.inf, shape=(5, self.window_size), dtype=np.float32),
             "state": spaces.Box(0, 1, shape=(1,), dtype=np.float32),
             "unrealized_pnl": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
         })
@@ -182,7 +181,7 @@ class TradingEnv(gym.Env):
         self.steps_taken += 1
 
         market_return = self.active_returns[self.idx_pos, 0].item()
-        step_returns = torch.exp(market_return) if action == 1 else 0
+        step_returns = np.exp(market_return) if action == 1 else 0
 
         delta_eta = step_returns - self.eta
         delta_sigma = (step_returns ** 2) - self.sigma
