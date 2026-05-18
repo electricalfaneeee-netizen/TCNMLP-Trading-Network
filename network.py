@@ -97,13 +97,13 @@ class TCNMLP(nn.Module):
         transformer_features = self.transformer(t_in, mask=mask)
         
         chart_features = self.feature_mlp(transformer_features)
-        state_features = torch.cat((self.state_mlp(state.unsqueeze(-1)), self.unrealized_pnl_mlp(unrealized_pnl.unsqueeze(-1))), dim=-1)
+        state_features = torch.cat((self.state_mlp(state), self.unrealized_pnl_mlp(unrealized_pnl)), dim=-1)
 
         avg_pool = self.avgpool(chart_features.transpose(1, 2)).squeeze(-1)
         max_pool = self.maxpool(chart_features.transpose(1, 2)).squeeze(-1)
         last_step = chart_features[:, -1, :]
 
-        combined = torch.cat((avg_pool, max_pool, last_step, state_features.squeeze(1)), dim=-1)
+        combined = torch.cat((avg_pool, max_pool, last_step, state_features), dim=-1)
 
         policy = self.actor(combined)
         value = self.critic(combined)

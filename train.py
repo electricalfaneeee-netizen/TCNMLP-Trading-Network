@@ -23,9 +23,9 @@ LR = 3e-4
 PPO_EPOCHS = 6
 CLIP_EPSILON = 0.12
 GAMMA = 0.99
-GAE_LAMBDA = 0.95
-ENTROPY_COEF = 0.015
-VALUE_COEF = 0.5
+GAE_LAMBDA = 0.92
+ENTROPY_COEF = 0.03
+VALUE_COEF = 0.3
 
 def yank5mMarketData(start_date, end_date, symbol):
     # Parse dates to milliseconds timestamp
@@ -79,7 +79,7 @@ def yank5mMarketData(start_date, end_date, symbol):
     df = df.reset_index(drop=True)
     return df
 
-def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.95):
+def compute_gae(rewards, values, next_value, masks, gamma=0.99, lam=0.92):
     n = len(rewards)
     advantages = torch.zeros((n, NUM_ENVS), device=device)
     last_gae_lam = 0
@@ -107,12 +107,12 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
     
     old_log_probs = torch.zeros((3072, NUM_ENVS, 2), device=device, dtype=torch.bfloat16)
     values_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
-    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device)
+    actions_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.long)
     rewards_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
     masks_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
 
     charts_tensor = torch.zeros((3072, NUM_ENVS, 5, 100), device=device, dtype=torch.bfloat16)
-    states_tensor = torch.zeros((3072, NUM_ENVS, 2), device=device, dtype=torch.bfloat16)
+    states_tensor = torch.zeros((3072, NUM_ENVS, 1), device=device, dtype=torch.bfloat16)
     unrealized_pnls_tensor = torch.zeros((3072, NUM_ENVS), device=device, dtype=torch.bfloat16)
 
     episode_returns = 0.0
@@ -131,7 +131,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
 
         old_log_probs[step].copy_(log_probs)
         values_tensor[step].copy_(values.squeeze())
-        actions_tensor[step].copy_(actions)
+        actions_tensor[step].copy_(actions.to(torch.long))
         
         new_obs, rewards, terms, truncs, info = envs.step(actions.detach().cpu().numpy())
         masks_tensor[step].copy_(torch.as_tensor(1.0 - (terms | truncs), dtype=torch.float32))
@@ -162,12 +162,11 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
     actions_tensor = actions_tensor.reshape(-1)
 
     charts_tensor = charts_tensor.reshape(-1, 5, 100)
-    states_tensor = states_tensor.reshape(-1, 2)
-    unrealized_pnls_tensor = unrealized_pnls_tensor.reshape(-1)
+    states_tensor = states_tensor.reshape(-1, 1)
+    unrealized_pnls_tensor = unrealized_pnls_tensor.reshape(-1, 1)
 
     advantages = advantages.reshape(-1)
     returns = returns.reshape(-1)
-
 
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -210,7 +209,7 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
                     surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * mb_advantages
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    v_targ = mb_returns
+                    v_targ = mb_returns * 0.1
                     v_clipped = mb_values + torch.clamp(new_values - mb_values, -CLIP_EPSILON, CLIP_EPSILON)
                     v_loss1 = (new_values - v_targ) ** 2
                     v_loss2 = (v_clipped - v_targ) ** 2
@@ -262,7 +261,7 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.08, total_iters=1000)
+    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=1000)
 
     dfs = {}
 
@@ -286,9 +285,7 @@ def main():
         raw_data = df.to_numpy().astype(np.float32)
 
         _windows = np.lib.stride_tricks.sliding_window_view(raw_data, window_shape=100, axis=0)
-        print(_windows.shape)
-
-        windows = np.ascontiguousarray(_windows.transpose(0, 2, 1))
+        windows = np.ascontiguousarray(_windows)
         
         price_slice = windows[:, :4, :]
         p_mean = price_slice.mean(axis=(1, 2), keepdims=True)
@@ -303,33 +300,35 @@ def main():
         windows = torch.tensor(windows, dtype=torch.float32, device=device)
         log_returns = torch.tensor(normalize_reward_data(df), dtype=torch.float32, device=device)
 
-        windows = windows.transpose(-1, -2)
-
         coin_vault[name] = {
             "windows": windows,
             "log_returns": log_returns
         }
 
-    print(f"Vault shape: {coin_vault[list(coin_vault.keys())[0]]['windows'].shape}")
-    
     envs = gym.vector.SyncVectorEnv([lambda: TradingEnv(coin_vault, window_size=100, max_steps=3072) for _ in range(NUM_ENVS)])
 
     history = []
     history_path = Path(f"{script_dir}/training_log.csv")
+
 
     for r in range (ROUNDS):
         model, round_stats = ppo_training_loop(envs, model, optimizer, scheduler)
         avg_returns = sum(s['returns'] for s in round_stats) / len(round_stats)
         avg_v_loss = sum(s['value_loss'] for s in round_stats) / len(round_stats)
         
-        print(f"Round {r + 1} | Avg Returns: {avg_returns:.4f} | Value Loss: {avg_v_loss:.6f}")
+        print(f"Round {r + 1} | Avg Returns: {avg_returns.mean():.4f} | Value Loss: {avg_v_loss:.6f}")
         
         for stat in round_stats:
             stat['round'] = r
             history.append(stat)
 
         if (r + 1) % 10 == 0:
-            pd.DataFrame(history).to_csv(history_path, index=False)
+            if history_path.exists():
+                pd.DataFrame(history).to_csv(history_path, mode='a', index=False, header=False)
+            else:
+                pd.DataFrame(history).to_csv(history_path, index=False)
+            history.clear()
+
             torch.save(model.state_dict(), f"{script_dir}/models/TCNMLP.pt")
             print(f"Round {r + 1} completed. Model and training log data saved.")
 
