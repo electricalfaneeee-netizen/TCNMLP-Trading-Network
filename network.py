@@ -172,22 +172,21 @@ class TradingEnv(gym.Env):
     def step(self, action: int) -> Tuple:
         fee = 0
         if action != self.active_state:
-            fee = -0.0001
-
-        if action == 1 and self.active_state == 0:
-            self.entry_idx = self.idx_pos
+            fee = -0.0005
+            if action == 1:
+                self.entry_idx = self.idx_pos
 
         self.idx_pos += 1
         self.steps_taken += 1
 
         market_return = self.active_returns[self.idx_pos, 0].item()
-        step_returns = np.exp(market_return) if action == 1 else 0
+        step_return = market_return if action == 1 else 0
 
-        delta_eta = step_returns - self.eta
-        delta_sigma = (step_returns ** 2) - self.sigma
+        delta_eta = step_return - self.eta
+        delta_sigma = (step_return ** 2) - self.sigma
 
         raw_dsr = ((self.sigma * delta_eta) - (0.5 * self.eta * delta_sigma)) / ((np.maximum(self.sigma - self.eta ** 2, 1e-8)) ** 1.5)
-        dsr = np.clip(raw_dsr, -1.0, 1.0)
+        dsr = np.clip(raw_dsr, -2.0, 2.0)
 
         self.eta += self.ema_decay * delta_eta
         self.sigma += self.ema_decay * delta_sigma
@@ -195,10 +194,27 @@ class TradingEnv(gym.Env):
         returns = (market_return * 10) if action == 1 else 0
         returns += fee
 
+        unrealized_pnl = 0.0
         if action == 1:
-            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item() * 10
-        else:
-            unrealized_pnl = 0.0
+            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
+            hold_duration = self.idx_pos - self.entry_idx
+            drawdown_penalty = min(0, unrealized_pnl) * 0.5
+            duration_cost = 0.0
+            if hold_duration > 50:
+                duration_cost = -0.0001 * np.log1p(hold_duration - 50)
+            dsr += drawdown_penalty + duration_cost
+
+        if action == 0:
+            opportunity = np.tanh(max(0, market_return) * 10) * 0.002
+            dsr -= opportunity
+            if self.active_state == 1:
+                hold_duration = max(1, self.idx_pos - self.entry_idx)
+                realized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
+                exit_bonus = realized_pnl / np.sqrt(1 + hold_duration)
+                exit_bonus = np.clip(exit_bonus, -0.01, 0.01)
+                dsr += exit_bonus
+
+        dsr += fee
 
         self.active_state = action
         done = self.steps_taken >= self.max_steps

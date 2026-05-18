@@ -15,7 +15,7 @@ timeframe = '5m'
 symbols = ["SOL/USDT", "AVAX/USDT", "RAY/USDT", "ETH/USDT"]
 
 # hyperparameters
-ROUNDS = 1000
+ROUNDS = 200
 NUM_ENVS = 10
 
 LR = 3e-4
@@ -25,7 +25,7 @@ CLIP_EPSILON = 0.12
 GAMMA = 0.99
 GAE_LAMBDA = 0.92
 ENTROPY_COEF = 0.03
-VALUE_COEF = 0.3
+VALUE_COEF = 0.5
 
 def yank5mMarketData(start_date, end_date, symbol):
     # Parse dates to milliseconds timestamp
@@ -243,12 +243,12 @@ def ppo_training_loop(envs, network, optimizer, scheduler):
 
 def main():
     encoder = TCNEncoder().to(device)
-    encoder.load_state_dict(torch.load(f"{script_dir}/models/encoder.pt", map_location=device))
+    # encoder.load_state_dict(torch.load(f"{script_dir}/models/encoder.pt", map_location=device))
 
-    for param in encoder.parameters():
-        param.requires_grad = False
+    # for param in encoder.parameters():
+    #     param.requires_grad = False
 
-    encoder.eval()
+    # encoder.eval()
 
     model_path = Path(f"{script_dir}/models/TCNMLP.pt")
         
@@ -261,7 +261,7 @@ def main():
             model.load_state_dict(torch.load(model_path, map_location=device))
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=1e-5)
-    scheduler = LinearLR(optimizer, start_factor=1, end_factor=0.1, total_iters=1000)
+    scheduler = LinearLR(optimizer, start_factor=0.5, end_factor=0.1, total_iters=200)
 
     dfs = {}
 
