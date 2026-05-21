@@ -170,9 +170,10 @@ class TradingEnv(gym.Env):
         return observations, {}
 
     def step(self, action: int) -> Tuple:
+        reward = 0
         fee = 0
         if action != self.active_state:
-            fee = -0.0005
+            fee = -0.001
             if action == 1:
                 self.entry_idx = self.idx_pos
 
@@ -182,39 +183,29 @@ class TradingEnv(gym.Env):
         market_return = self.active_returns[self.idx_pos, 0].item()
         step_return = market_return if action == 1 else 0
 
+        returns = (market_return * 10) if action == 1 else 0
+        returns += fee
+
         delta_eta = step_return - self.eta
         delta_sigma = (step_return ** 2) - self.sigma
 
         raw_dsr = ((self.sigma * delta_eta) - (0.5 * self.eta * delta_sigma)) / ((np.maximum(self.sigma - self.eta ** 2, 1e-8)) ** 1.5)
-        dsr = np.clip(raw_dsr, -2.0, 2.0)
+        dsr = np.clip(raw_dsr, -1.0, 1.0)
+        reward += dsr
 
         self.eta += self.ema_decay * delta_eta
         self.sigma += self.ema_decay * delta_sigma
 
-        returns = (market_return * 10) if action == 1 else 0
-        returns += fee
-
-        unrealized_pnl = 0.0
+        unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
         if action == 1:
-            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
-            hold_duration = self.idx_pos - self.entry_idx
-            drawdown_penalty = min(0, unrealized_pnl) * 0.5
-            duration_cost = 0.0
-            if hold_duration > 50:
-                duration_cost = -0.0001 * np.log1p(hold_duration - 50)
-            dsr += drawdown_penalty + duration_cost
+            drawdown_penalty = min(0, unrealized_pnl) * 2
+            reward += drawdown_penalty
 
         if action == 0:
-            opportunity = np.tanh(max(0, market_return) * 10) * 0.002
-            dsr -= opportunity
-            if self.active_state == 1:
-                hold_duration = max(1, self.idx_pos - self.entry_idx)
-                realized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
-                exit_bonus = realized_pnl / np.sqrt(1 + hold_duration)
-                exit_bonus = np.clip(exit_bonus, -0.01, 0.01)
-                dsr += exit_bonus
+            opportunity = np.tanh(max(0, market_return) * 10) * 0.001
+            reward -= opportunity
 
-        dsr += fee
+        reward += fee
 
         self.active_state = action
         done = self.steps_taken >= self.max_steps
@@ -229,7 +220,7 @@ class TradingEnv(gym.Env):
             "returns": returns
         }
 
-        return observation, float(dsr), done, False, info
+        return observation, float(reward), done, False, info
 
 def normalize_reward_data(df: pd.DataFrame):
     df_nn = pd.DataFrame(index=df.index)

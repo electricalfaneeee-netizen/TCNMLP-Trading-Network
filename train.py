@@ -24,7 +24,7 @@ PPO_EPOCHS = 6
 CLIP_EPSILON = 0.12
 GAMMA = 0.99
 GAE_LAMBDA = 0.92
-ENTROPY_COEF = 0.03
+ENTROPY_COEF = 0.005
 VALUE_COEF = 0.5
 
 def yank5mMarketData(start_date, end_date, symbol):
