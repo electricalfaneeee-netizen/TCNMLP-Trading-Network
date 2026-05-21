@@ -182,22 +182,23 @@ class TradingEnv(gym.Env):
 
         market_return = self.active_returns[self.idx_pos, 0].item()
         step_return = market_return if action == 1 else 0
-
-        returns = (market_return * 10) if action == 1 else 0
-        returns += fee
+        step_return += fee
 
         delta_eta = step_return - self.eta
-        delta_sigma = (step_return ** 2) - self.sigma
+        delta_second_moment = (step_return ** 2) - (self.sigma + self.eta ** 2)
 
-        raw_dsr = ((self.sigma * delta_eta) - (0.5 * self.eta * delta_sigma)) / ((np.maximum(self.sigma - self.eta ** 2, 1e-8)) ** 1.5)
+        running_variance = np.maximum(self.sigma, 1e-8)
+        raw_dsr = ((running_variance * delta_eta) - (0.5 * self.eta * delta_second_moment)) / (running_variance ** 1.5)
+
         dsr = np.clip(raw_dsr, -1.0, 1.0)
         reward += dsr
 
         self.eta += self.ema_decay * delta_eta
-        self.sigma += self.ema_decay * delta_sigma
+        self.sigma += self.ema_decay * ((1 - self.ema_decay) * (delta_eta ** 2) - self.sigma)
 
-        unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
+        unrealized_pnl = 0
         if action == 1:
+            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
             drawdown_penalty = min(0, unrealized_pnl) * 2
             reward += drawdown_penalty
 
@@ -205,7 +206,8 @@ class TradingEnv(gym.Env):
             opportunity = np.tanh(max(0, market_return) * 10) * 0.001
             reward -= opportunity
 
-        reward += fee
+        returns = (market_return * 10) if action == 1 else 0
+        returns += fee
 
         self.active_state = action
         done = self.steps_taken >= self.max_steps
