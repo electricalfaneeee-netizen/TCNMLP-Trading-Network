@@ -172,17 +172,25 @@ class TradingEnv(gym.Env):
     def step(self, action: int) -> Tuple:
         reward = 0
         fee = 0
+        opportunity = 0
+
         if action != self.active_state:
             fee = -0.001
-            if action == 1:
-                self.entry_idx = self.idx_pos
 
         self.idx_pos += 1
         self.steps_taken += 1
 
+        if action != self.active_state and action == 1:
+            self.entry_idx = self.idx_pos
+
         market_return = self.active_returns[self.idx_pos, 0].item()
+
+        if action == 0:
+            opportunity = max(0, market_return) * 0.05
+
         step_return = market_return if action == 1 else 0
         step_return += fee
+        step_return -= opportunity
 
         delta_eta = step_return - self.eta
         delta_second_moment = (step_return ** 2) - (self.sigma + self.eta ** 2)
@@ -194,17 +202,9 @@ class TradingEnv(gym.Env):
         reward += dsr
 
         self.eta += self.ema_decay * delta_eta
-        self.sigma += self.ema_decay * ((1 - self.ema_decay) * (delta_eta ** 2) - self.sigma)
+        self.sigma += self.ema_decay * (delta_second_moment - self.sigma)
 
-        unrealized_pnl = 0
-        if action == 1:
-            unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos + 1, 0]).item()
-            drawdown_penalty = min(0, unrealized_pnl) * 2
-            reward += drawdown_penalty
-
-        if action == 0:
-            opportunity = np.tanh(max(0, market_return) * 10) * 0.001
-            reward -= opportunity
+        unrealized_pnl = torch.sum(self.active_returns[self.entry_idx:self.idx_pos, 0]).item() if action == 1 else 0
 
         returns = (market_return * 10) if action == 1 else 0
         returns += fee
